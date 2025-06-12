@@ -20,16 +20,17 @@ mongoose.connect('mongodb+srv://eyup:D0ufczveKH9z6oeJ@cluster0.rl4cnoc.mongodb.n
   console.error('MongoDB bağlantı hatası:', err);
 });
 
-// Takım Modeli (Yeni)
+// Takım Modeli
 const teamSchema = new mongoose.Schema({
   teamId: { type: String, required: true, unique: true },
   teamName: { type: String, required: true },
+  teamLeaderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // Takım lideri
   createdAt: { type: Date, default: Date.now }
 });
 
 const Team = mongoose.model('Team', teamSchema);
 
-// Kategori Modeli (Yeni)
+// Kategori Modeli
 const categorySchema = new mongoose.Schema({
   name: { type: String, required: true, unique: true },
   createdAt: { type: Date, default: Date.now }
@@ -37,34 +38,57 @@ const categorySchema = new mongoose.Schema({
 
 const Category = mongoose.model('Category', categorySchema);
 
-// Kullanıcı Modeli (Güncellenmiş)
+// Kullanıcı Modeli (Güncellenmiş - Takım Lideri Rolü Eklendi)
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  teamId: { type: String, required: true }, // Takım kimliği
-  isAdmin: { type: Boolean, default: false }, // Admin yetkisi
+  teamId: { type: String, required: true },
+  isAdmin: { type: Boolean, default: false },
+  isTeamLeader: { type: Boolean, default: false }, // Yeni: Takım lideri rolü
   createdAt: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model('User', userSchema);
 
-// Senaryo Modeli (Güncellenmiş)
+// Senaryo Modeli (Güncellenmiş - Onay Sistemi Eklendi)
 const scenarioSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   username: { type: String, required: true },
-  teamId: { type: String, required: true }, // Takım kimliği
-  teamName: { type: String, required: true }, // Takım adı
+  teamId: { type: String, required: true },
+  teamName: { type: String, required: true },
   ongoruler: { type: String, required: true },
   scenario: { type: String, required: true },
-  category: { type: String, default: 'Kategorisiz' }, // Kategori
+  category: { type: String, default: 'Kategorisiz' },
+  
+  // Yeni: Onay sistemi için alanlar
+  approvalStatus: { 
+    type: String, 
+    enum: ['approved', 'pending', 'rejected'], 
+    default: 'approved' // İlk oluşturulan senaryolar otomatik onaylı
+  },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  approvalDate: { type: Date, default: null },
+  rejectionReason: { type: String, default: null },
+  
+  // Düzenleme geçmişi
+  editHistory: [{
+    editedAt: { type: Date, default: Date.now },
+    previousOngoruler: { type: String },
+    previousScenario: { type: String },
+    editReason: { type: String }
+  }],
+  
+  isEdited: { type: Boolean, default: false },
+  lastEditedAt: { type: Date, default: null },
+  
   createdAt: { type: Date, default: Date.now }
 });
 
 const Scenario = mongoose.model('Scenario', scenarioSchema);
 
 // JWT Secret
-const JWT_SECRET = 'your-secret-key'; // Gerçek bir uygulamada çevresel değişkenlerden alınmalı
+const JWT_SECRET = 'your-secret-key';
 
 // Kimlik Doğrulama Middleware
 const auth = (req, res, next) => {
@@ -91,6 +115,20 @@ const isAdmin = async (req, res, next) => {
   }
 };
 
+// Takım Lideri Yetkisi Kontrolü Middleware
+const isTeamLeader = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user || (!user.isTeamLeader && !user.isAdmin)) {
+      return res.status(403).json({ error: 'Bu işlem için takım lideri veya admin yetkisi gerekiyor' });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+};
+
 // Senaryo kaydetme (Güncellenmiş)
 app.post('/api/save_scenario', auth, async (req, res) => {
   try {
@@ -99,11 +137,7 @@ app.post('/api/save_scenario', auth, async (req, res) => {
     if (!user) {
       return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
     }
-    // if (!scenario || scenario.trim().length === 0) {
-    //   return res.status(400).json({ error: 'Senaryo oluşturulamadı. AI modelinden boş yanıt geldi.' });
-    // }
 
-    // Kullanıcının takım bilgisini al
     const team = await Team.findOne({ teamId: user.teamId });
     const teamName = team ? team.teamName : 'Bilinmeyen Takım';
 
@@ -114,7 +148,8 @@ app.post('/api/save_scenario', auth, async (req, res) => {
       teamName: teamName,
       ongoruler,
       scenario,
-      category: 'Kategorisiz' // Varsayılan kategori
+      category: 'Kategorisiz',
+      approvalStatus: 'approved' // Yeni senaryolar otomatik onaylı
     });
 
     await newScenario.save();
@@ -129,7 +164,119 @@ app.post('/api/save_scenario', auth, async (req, res) => {
   }
 });
 
-// Senaryoları listeleme (Güncellenmiş - Takım yetkilerine göre)
+// Senaryo düzenleme (Yeni)
+app.put('/api/scenarios/:scenarioId/edit', auth, async (req, res) => {
+  try {
+    const { scenarioId } = req.params;
+    const { ongoruler, scenario, editReason } = req.body;
+    const user = await User.findById(req.userId);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+    }
+
+    const existingScenario = await Scenario.findById(scenarioId);
+    if (!existingScenario) {
+      return res.status(404).json({ error: 'Senaryo bulunamadı' });
+    }
+
+    // Sadece kendi senaryosunu düzenleyebilir (admin hariç)
+    if (!user.isAdmin && existingScenario.userId.toString() !== req.userId) {
+      return res.status(403).json({ error: 'Bu senaryoyu düzenleme yetkiniz yok' });
+    }
+
+    // Düzenleme geçmişine ekle
+    existingScenario.editHistory.push({
+      editedAt: new Date(),
+      previousOngoruler: existingScenario.ongoruler,
+      previousScenario: existingScenario.scenario,
+      editReason: editReason || 'Düzenleme nedeni belirtilmedi'
+    });
+
+    // Senaryoyu güncelle
+    existingScenario.ongoruler = ongoruler;
+    existingScenario.scenario = scenario;
+    existingScenario.isEdited = true;
+    existingScenario.lastEditedAt = new Date();
+    existingScenario.approvalStatus = 'pending'; // Düzenleme sonrası onay beklemede
+    existingScenario.approvedBy = null;
+    existingScenario.approvalDate = null;
+    existingScenario.rejectionReason = null;
+
+    await existingScenario.save();
+
+    res.status(200).json({ 
+      message: 'Senaryo başarıyla düzenlendi ve onay için gönderildi',
+      scenario: existingScenario
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// Senaryoları onaylama/reddetme (Takım lideri için)
+app.put('/api/scenarios/:scenarioId/approve', auth, isTeamLeader, async (req, res) => {
+  try {
+    const { scenarioId } = req.params;
+    const { action, rejectionReason } = req.body; // action: 'approve' veya 'reject'
+    
+    const scenario = await Scenario.findById(scenarioId);
+    if (!scenario) {
+      return res.status(404).json({ error: 'Senaryo bulunamadı' });
+    }
+
+    // Takım lideri sadece kendi takımının senaryolarını onaylayabilir (admin hariç)
+    if (!req.user.isAdmin && scenario.teamId !== req.user.teamId) {
+      return res.status(403).json({ error: 'Bu senaryoyu onaylama yetkiniz yok' });
+    }
+
+    if (action === 'approve') {
+      scenario.approvalStatus = 'approved';
+      scenario.approvedBy = req.userId;
+      scenario.approvalDate = new Date();
+      scenario.rejectionReason = null;
+    } else if (action === 'reject') {
+      scenario.approvalStatus = 'rejected';
+      scenario.rejectionReason = rejectionReason || 'Red nedeni belirtilmedi';
+      scenario.approvedBy = req.userId;
+      scenario.approvalDate = new Date();
+    }
+
+    await scenario.save();
+
+    res.status(200).json({ 
+      message: action === 'approve' ? 'Senaryo onaylandı' : 'Senaryo reddedildi',
+      scenario 
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// Onay bekleyen senaryoları listeleme (Takım lideri için)
+app.get('/api/scenarios/pending-approval', auth, isTeamLeader, async (req, res) => {
+  try {
+    let query = { approvalStatus: 'pending' };
+    
+    // Admin olmayan takım liderleri sadece kendi takımlarını görebilir
+    if (!req.user.isAdmin) {
+      query.teamId = req.user.teamId;
+    }
+    
+    const scenarios = await Scenario.find(query)
+      .populate('userId', 'username email')
+      .sort({ lastEditedAt: -1 });
+    
+    res.status(200).json({ scenarios });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// Senaryoları listeleme (Güncellenmiş - onay durumu dahil)
 app.get('/api/scenarios', auth, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
@@ -139,11 +286,9 @@ app.get('/api/scenarios', auth, async (req, res) => {
 
     let scenarios;
     
-    // Admin tüm senaryoları görebilir
     if (user.isAdmin) {
       scenarios = await Scenario.find().sort({ createdAt: -1 });
     } else {
-      // Normal kullanıcı sadece kendi takımının senaryolarını görebilir
       scenarios = await Scenario.find({ teamId: user.teamId }).sort({ createdAt: -1 });
     }
     
@@ -154,7 +299,88 @@ app.get('/api/scenarios', auth, async (req, res) => {
   }
 });
 
-// Senaryoları kategoriye göre filtreleme (Yeni)
+// Takım lideri atama (Admin için)
+app.put('/api/admin/teams/:teamId/assign-leader', auth, isAdmin, async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    const { userId } = req.body;
+    
+    // Kullanıcıyı kontrol et
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+    }
+    
+    // Kullanıcının takımını kontrol et
+    if (user.teamId !== teamId) {
+      return res.status(400).json({ error: 'Kullanıcı bu takımda değil' });
+    }
+    
+    // Eski takım liderinin yetkisini kaldır
+    await User.updateMany(
+      { teamId: teamId, isTeamLeader: true },
+      { isTeamLeader: false }
+    );
+    
+    // Yeni takım liderini ata
+    user.isTeamLeader = true;
+    await user.save();
+    
+    // Takım tablosunu güncelle
+    await Team.findOneAndUpdate(
+      { teamId: teamId },
+      { teamLeaderId: userId }
+    );
+    
+    res.status(200).json({ 
+      message: 'Takım lideri başarıyla atandı',
+      teamLeader: user
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// Takım liderini kaldırma (Admin için)
+app.delete('/api/admin/teams/:teamId/remove-leader', auth, isAdmin, async (req, res) => {
+  try {
+    const { teamId } = req.params;
+    
+    // Takım liderinin yetkisini kaldır
+    await User.updateMany(
+      { teamId: teamId, isTeamLeader: true },
+      { isTeamLeader: false }
+    );
+    
+    // Takım tablosunu güncelle
+    await Team.findOneAndUpdate(
+      { teamId: teamId },
+      { teamLeaderId: null }
+    );
+    
+    res.status(200).json({ message: 'Takım lideri başarıyla kaldırıldı' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// Takımları takım lideri bilgisi ile listeleme (Admin için)
+app.get('/api/admin/teams-with-leaders', auth, isAdmin, async (req, res) => {
+  try {
+    const teams = await Team.find()
+      .populate('teamLeaderId', 'username email')
+      .sort({ teamName: 1 });
+    
+    res.status(200).json({ teams });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Sunucu hatası' });
+  }
+});
+
+// Senaryoları kategoriye göre filtreleme (Güncellenmiş)
 app.get('/api/scenarios/filter', auth, async (req, res) => {
   try {
     const { category } = req.query;
@@ -166,12 +392,10 @@ app.get('/api/scenarios/filter', auth, async (req, res) => {
 
     let query = {};
     
-    // Kategori filtreleme
     if (category && category !== 'all') {
       query.category = category;
     }
     
-    // Admin olmayan kullanıcılar sadece kendi takımlarının senaryolarını görebilir
     if (!user.isAdmin) {
       query.teamId = user.teamId;
     }
@@ -258,7 +482,6 @@ app.get('/api/teams', auth, isAdmin, async (req, res) => {
 // Takımları listeleme (Kayıt sayfası için - kimlik doğrulama gerekmez)
 app.get('/api/public/teams', async (req, res) => {
   try {
-    // Admin takımını hariç tut
     const teams = await Team.find({ teamId: { $ne: 'admin' } }).sort({ teamName: 1 });
     res.status(200).json({ teams });
   } catch (error) {
@@ -290,27 +513,26 @@ app.post('/api/teams', auth, isAdmin, async (req, res) => {
   }
 });
 
-// Kayıt Olma (Güncellenmiş - takım seçimi ile)
+// Kayıt Olma (Güncellenmiş)
 app.post('/api/register', async (req, res) => {
   try {
     const { username, email, password, teamId } = req.body;
     
-    // Kullanıcı adı veya e-posta kontrolü
     const existingUser = await User.findOne({ $or: [{ email }, { username }] });
     if (existingUser) {
       return res.status(400).json({ error: 'Bu kullanıcı adı veya e-posta zaten kullanılıyor' });
     }
-    // Şifreyi hashle
+
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     
-     // Varsayılan olarak "default" takım ataması yap
-     const user = new User({
+    const user = new User({
       username,
       email,
       password: hashedPassword,
-      teamId: 'default', // Varsayılan takım ID'si
-      isAdmin: false
+      teamId: 'default',
+      isAdmin: false,
+      isTeamLeader: false
     });
 
     await user.save();
@@ -325,7 +547,8 @@ app.post('/api/register', async (req, res) => {
         username: user.username,
         email: user.email,
         teamId: user.teamId,
-        isAdmin: user.isAdmin
+        isAdmin: user.isAdmin,
+        isTeamLeader: user.isTeamLeader
       }
     });
   } catch (error) {
@@ -334,7 +557,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// Giriş Yapma (Güncellenmiş - takım ve admin bilgilerini döndürür)
+// Giriş Yapma (Güncellenmiş)
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -358,7 +581,8 @@ app.post('/api/login', async (req, res) => {
         username: user.username,
         email: user.email,
         teamId: user.teamId,
-        isAdmin: user.isAdmin
+        isAdmin: user.isAdmin,
+        isTeamLeader: user.isTeamLeader
       }
     });
   } catch (error) {
@@ -367,7 +591,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Kullanıcı bilgisi kontrol (Güncellenmiş - takım ve admin bilgilerini içerir)
+// Kullanıcı bilgisi kontrol (Güncellenmiş)
 app.get('/api/user', auth, async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('-password');
@@ -375,7 +599,6 @@ app.get('/api/user', auth, async (req, res) => {
       return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
     }
     
-    // Takım bilgisini ekle
     const team = await Team.findOne({ teamId: user.teamId });
     
     res.status(200).json({ 
@@ -389,12 +612,12 @@ app.get('/api/user', auth, async (req, res) => {
     res.status(500).json({ error: 'Sunucu hatası' });
   }
 });
+
 // Tüm kullanıcıları listeleme (Sadece adminler için)
 app.get('/api/admin/users', auth, isAdmin, async (req, res) => {
   try {
     const users = await User.find().sort({ createdAt: -1 });
     
-    // Takım bilgilerini ekle
     const usersWithTeams = await Promise.all(users.map(async (user) => {
       const team = await Team.findOne({ teamId: user.teamId });
       return {
@@ -416,16 +639,14 @@ app.put('/api/admin/users/:userId/team', auth, isAdmin, async (req, res) => {
     const { userId } = req.params;
     const { teamId } = req.body;
     
-    // Takım kontrolü
     const team = await Team.findOne({ teamId });
     if (!team) {
       return res.status(400).json({ error: 'Geçersiz takım ID' });
     }
     
-    // Kullanıcı güncellemesi
     const updatedUser = await User.findByIdAndUpdate(
       userId,
-      { teamId },
+      { teamId, isTeamLeader: false }, // Takım değiştiğinde takım lideri yetkisini kaldır
       { new: true }
     );
     
@@ -442,24 +663,22 @@ app.put('/api/admin/users/:userId/team', auth, isAdmin, async (req, res) => {
     res.status(500).json({ error: 'Sunucu hatası' });
   }
 });
+
 // Başlangıçta varsayılan takımları ve kategorileri oluştur
 const initializeData = async () => {
   try {
-    // Admin takımını kontrol et ve yoksa oluştur
     const adminTeam = await Team.findOne({ teamId: 'admin' });
     if (!adminTeam) {
       await new Team({ teamId: 'admin', teamName: 'Yönetim Ekibi' }).save();
       console.log('Admin takımı oluşturuldu');
     }
     
-    // Varsayılan bir takım oluştur
     const defaultTeam = await Team.findOne({ teamId: 'default' });
     if (!defaultTeam) {
       await new Team({ teamId: 'default', teamName: 'Genel Ekip' }).save();
       console.log('Varsayılan takım oluşturuldu');
     }
     
-    // Varsayılan kategorileri oluştur
     const categories = ['Kategorisiz', 'Ekonomi', 'Teknoloji', 'Sağlık', 'Eğitim'];
     for (const categoryName of categories) {
       const existingCategory = await Category.findOne({ name: categoryName });
@@ -473,7 +692,6 @@ const initializeData = async () => {
   }
 };
 
-// Sunucu başlatıldığında veri başlatma
 app.listen(PORT, () => {
   console.log(`Server ${PORT} portunda çalışıyor`);
   initializeData();
